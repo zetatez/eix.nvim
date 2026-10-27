@@ -1,0 +1,280 @@
+*eix.nvim*            Neovim frontend for the eix coding agent
+
+==============================================================================
+CONTENTS                                                     *eix.nvim-contents*
+
+  1. Introduction ................................ |eix.nvim-introduction|
+  2. Requirements ................................ |eix.nvim-requirements|
+  3. Setup ....................................... |eix.nvim-setup|
+  4. Commands .................................... |eix.nvim-commands|
+  5. Ask ......................................... |eix.nvim-ask|
+  6. TUI terminal ................................ |eix.nvim-terminal|
+  7. Context placeholders ........................ |eix.nvim-context|
+  8. API ......................................... |eix.nvim-api|
+  9. Events ...................................... |eix.nvim-events|
+ 10. Configuration ............................... |eix.nvim-config|
+ 11. Health and tests ............................ |eix.nvim-health|
+
+==============================================================================
+1. INTRODUCTION                                          *eix.nvim-introduction*
+
+eix.nvim follows opencode.nvim's approach: it keeps the agent's own terminal
+UI and adds the editor glue around it.
+
+  - ask in a small floating window at the cursor
+  - open the real `eix` TUI in a new terminal window, in the session directory
+  - pick a common prompt or open the TUI
+  - send a motion or visual range with `g@`
+  - expand `@this`, `@buffer`, `@diagnostics`, `@diff` and friends
+
+The plugin does not draw a chat transcript and does not embed a terminal. eix
+owns streaming, tool output, diffs and approvals in its own window; Neovim and
+the terminal eix share the same sessions.
+
+==============================================================================
+2. REQUIREMENTS                                          *eix.nvim-requirements*
+
+  - Neovim 0.11 or newer.
+  - The `eix` executable on `PATH`, or `eix_cmd` configured.
+  - A reachable daemon. With `auto_start` (default), the plugin runs
+    `eix status --json` to discover or start it.
+  - Optional: fzf-lua for a fuzzy |eix.nvim-select| picker. Without it the
+    native `vim.ui.select()` is used.
+  - A terminal emulator (st, kitty, ghostty, wezterm, alacritty, foot, konsole,
+    xterm, ...) or tmux. See |eix.nvim-terminal|.
+  - Optional on X11: wmctrl, so `:Eix` can find the TUI window and close it
+    again. Without it `:Eix` only ever opens a new window.
+
+==============================================================================
+3. SETUP                                                       *eix.nvim-setup*
+
+Call `setup()` to configure options; commands work without it.
+
+lazy.nvim: >lua
+  {
+    "zetatez/eix.nvim",
+    config = function()
+      require("eix").setup()
+    end,
+  }
+<
+Suggested mappings, matching opencode.nvim: >lua
+  vim.keymap.set({ "n", "x" }, "<leader>s", "<Plug>(EixAsk)",    { desc = "Ask eix…" })
+  vim.keymap.set({ "n", "x" }, "<leader>o", "<Plug>(EixSelect)", { desc = "Select eix…" })
+  vim.keymap.set("n", "<leader>t", "<Plug>(EixToggle)",          { desc = "Toggle eix TUI" })
+<
+To send a range immediately without the floating prompt: >lua
+  vim.keymap.set("n", "<leader>go", "<Plug>(EixOperator)")
+  -- <leader>go ip, <leader>go G, ...
+<
+`<Plug>(EixOperator)` sends `@this`. Use the API for a different prompt: >lua
+  vim.keymap.set("n", "go", function()
+    return require("eix").operator("Explain @this")
+  end, { expr = true })
+<
+==============================================================================
+4. COMMANDS                                                *eix.nvim-commands*
+
+:Eix [session_id]         Open the TUI, or close its window if it is open.
+:EixAsk [text]            Open the ask float, optionally pre-filled.
+:EixSelect                Open the prompt picker.
+
+`:EixAsk` supports a range: >vim
+  :'<,'>EixAsk
+  :10,20EixAsk why is this slow?
+<
+<Plug> mappings:
+  <Plug>(EixAsk)          Normal: ask about this line. Visual: about the range.
+  <Plug>(EixSelect)       Prompt picker.
+  <Plug>(EixOperator)     `g@` operator that sends `@this`.
+  <Plug>(EixToggle)       Open the TUI, or close its window if it is open.
+
+==============================================================================
+5. ASK                                                          *eix.nvim-ask*
+
+`ask()` opens a small cursor-relative float. `<CR>` submits, `<Esc>` cancels.
+
+The text is expanded with |eix.nvim-context| placeholders and sent with
+`prompt.submit` to the session for the current workspace. With `auto_open`
+(default) the TUI opens in a terminal window (once per session) while it
+streams.
+
+When a turn is already running the prompt is not rejected: it is kept in a
+per-session queue and sent as soon as that session is idle. Queued prompts keep
+their order and a notification reports how many are waiting. This also applies
+to `prompt()` and the operator mapping.
+
+`<Plug>(EixAsk)` pre-fills `@this: `, so the current line or visual range is
+attached unless you delete it. >lua
+  require("eix").ask("@this: what does this do?")
+  require("eix").ask()  -- empty prompt
+<
+==============================================================================
+6. TUI TERMINAL                                          *eix.nvim-terminal*
+
+eix is a full-screen TUI, so it runs in its own terminal window rather than
+inside Neovim. `open()` starts something like: >sh
+  st -e sh -c "cd /path/to/project && exec eix tui --session <id>"
+<
+The launcher is picked in this order:
+
+  1. `terminal.cmd`, when configured (forces that terminal)
+  2. `tmux new-window` when Neovim runs inside tmux
+  3. `terminal.prefer`, when configured: the first entry that is installed
+  4. otherwise the terminal Neovim itself runs in (detected from the process
+     tree, with environment hints as a fallback), then the default order:
+     `st`, `kitty`, `ghostty`, `wezterm`, `alacritty`, `foot`, `konsole`,
+     `gnome-terminal`, `xterm`
+
+So Neovim running in `st` opens a new `st` window, and Neovim running in
+`kitty` opens `kitty`. Pin an explicit order when the defaults do not fit: >lua
+  require("eix").setup({
+    terminal = { prefer = { "kitty", "st" } },  -- first installed wins
+  })
+<
+`terminal.cmd` is a command prefix that accepts `sh -c <script>`, so any
+terminal works: >lua
+  require("eix").setup({
+    terminal = { cmd = { "ghostty", "-e" } },
+  })
+<
+The window starts in the session directory and talks to the same daemon as the
+plugin. Its title is `eix · <session name>`, so `<leader>t` or `:Eix` can find
+it: when that window is already open the command closes it again (`wmctrl` on
+X11, `tmux kill-window` inside tmux); otherwise it spawns one. The daemon and a
+running turn keep going after the window closes. Call `open()` directly to
+force another window. After the first prompt for a session, `auto_open` does
+not spawn duplicate windows either.
+
+The terminal is launched in the background and reparented to init, so it is not
+a child of Neovim. Window managers with a "swallow" patch (dwm and its forks)
+otherwise hide the terminal that runs Neovim when a new window descends from
+it, making the editor disappear behind eix.
+
+Workspace: sessions, the TUI and `@diff` use the directory of the file in the
+current buffer, not Neovim's working directory.
+
+  in a git repository    the repository root
+  outside git            the file's own directory
+  no file (scratch)      Neovim's working directory
+
+So `:Eix` from `lua/eix/ui/ask.lua` starts eix at the repository root, even if
+Neovim was started elsewhere. Pass `cwd` to `prompt()` or `open()` to override.
+
+==============================================================================
+7. CONTEXT PLACEHOLDERS                                    *eix.nvim-context*
+
+Placeholders are expanded before submission:
+
+  @this          current line, or the active/explicit range
+  @buffer        whole current buffer
+  @buffers       paths of loaded, listed file buffers
+  @diagnostics   diagnostics for the buffer (filtered by the range)
+  @quickfix      file-backed quickfix entries
+  @visible       text visible in the current tab page
+  @diff          uncommitted `git diff` for the workspace
+
+Matching is boundary-aware: `mail@this.example` and `@buffers2` are not
+expanded. Each expansion is capped by `context.max_lines` and
+`context.max_bytes`. Disable one with `context.placeholders`.
+
+Context always comes from the window you are editing; there is no terminal
+buffer to skip.
+
+==============================================================================
+8. API                                                          *eix.nvim-api*
+
+All functions are available on `require("eix")`:
+
+  setup(opts)
+  ask(default?, range?)     floating prompt
+  prompt(text, opts?)       submit directly
+  operator(text)            returns "g@"
+  operator_range(kind?)     range covered by the last motion
+  select()
+  open(opts?, cb?)          always spawn a terminal
+  toggle(opts?, cb?)        open, or close the existing window
+  statusline()
+
+Approvals, models, agents, modes, forks and background processes live in the
+eix TUI, so the plugin does not duplicate them. Approvals and questions are
+still forwarded to `vim.notify` while you work in Neovim.
+
+==============================================================================
+9. EVENTS                                                  *eix.nvim-events*
+
+`require("eix.events")` exposes the daemon notification stream: >lua
+  local events = require("eix.events")
+  events.on("turn.completed", function(params) end)
+  events.on("message.delta", function(params) end)
+  events.on("tool.approval_required", function(params) end)
+<
+==============================================================================
+10. CONFIGURATION                                             *eix.nvim-config*
+
+Defaults: >lua
+  require("eix").setup({
+    eix_cmd = "eix",        -- string or argv table
+    socket = nil,           -- explicit unix socket
+    endpoint = nil,         -- unix path or "tcp://host:port"
+    token = nil,            -- token for a TCP endpoint
+    auto_start = true,
+    auto_reconnect = true,
+    request_timeout = 0,    -- milliseconds; 0 disables
+    auto_open = true,       -- open the TUI after submitting
+    notifications = true,
+
+    terminal = {
+      cmd = nil,            -- e.g. { "ghostty", "-e" }; forces a terminal
+      prefer = nil,         -- e.g. { "kitty", "st" }; first installed wins
+    },
+
+    ask = {
+      width = 0.4,          -- ask float width fraction
+    },
+
+    select = {
+      prompts = {
+        ["Explain this"] = "Explain @this and its context",
+        ["Fix diagnostics"] = "Fix @diagnostics",
+        ["Review this"] = "Review @this for correctness and readability",
+        ["Add tests"] = "Add tests for @this",
+        ["Document this"] = "Add comments documenting @this",
+        ["Implement this"] = "Implement @this",
+        ["Optimize this"] = "Optimize @this for performance and readability",
+      },
+    },
+
+    context = {
+      max_lines = 300,
+      max_bytes = 60000,
+      placeholders = {},
+    },
+  })
+<
+With a TCP daemon, the plugin authenticates the RPC connection and passes the
+endpoint and token to the TUI: >lua
+  require("eix").setup({
+    endpoint = "tcp://127.0.0.1:7777",
+    token = vim.env.EIX_TCP_TOKEN,
+  })
+<
+Statusline: >lua
+  vim.o.statusline = "%{%v:lua.eix_statusline()%} " .. vim.o.statusline
+<
+==============================================================================
+11. HEALTH AND TESTS                                        *eix.nvim-health*
+
+  :checkhealth eix
+
+reports the Neovim version, the eix binary, the resolved socket,
+`eix status --json`, an RPC `hello` handshake and whether the plugin is
+connected.
+
+  tests/run.sh
+  EIX_BIN=/path/to/eix tests/run.sh
+
+The integration test starts an isolated daemon, creates a session, builds and
+spawns the TUI launcher command, then deletes the session.
+
+vim:tw=78:ts=8:noet:ft=help:norl:
